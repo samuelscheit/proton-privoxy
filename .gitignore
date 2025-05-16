@@ -1,2 +1,3 @@
 .env
-ovpn_configs
+ovpn_configs/*
+my_host_auth.txt

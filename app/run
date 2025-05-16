@@ -1,0 +1,59 @@
+#!/bin/sh
+set -e # Exit immediately if a command exits with a non-zero status.
+# set -x # Uncomment for verbose debugging of this script
+
+echo "--- ProtonVPN Direct OpenVPN Entrypoint ---"
+
+# --- ENSURE /dev/net/tun EXISTS ---
+if [ ! -c /dev/net/tun ]; then
+  echo "Creating /dev/net/tun device..."
+  if [ ! -d /dev/net ]; then
+    mkdir -m 755 /dev/net
+  fi
+  mknod /dev/net/tun c 10 200
+  chmod 0666 /dev/net/tun
+  echo "Created /dev/net/tun."
+else
+  echo "/dev/net/tun already exists."
+fi
+
+# --- VALIDATE REQUIRED ENVIRONMENT VARIABLES ---
+if [ -z "$PVPN_USERNAME" ]; then
+  echo "Error: PVPN_USERNAME environment variable is not set. Check your .env file."
+  exit 1
+fi
+if [ -z "$PVPN_PASSWORD" ]; then
+  echo "Error: PVPN_PASSWORD environment variable is not set. Check your .env file."
+  exit 1
+fi
+# PVPN_OVPN_FILE is no longer directly used by this script for OpenVPN start,
+# but the supervisor will pick files. We can remove this check or leave it as a general sanity check.
+# For now, let's comment it out as the supervisor handles individual file selection.
+# if [ -z "$PVPN_OVPN_FILE" ]; then
+#   echo "Error: PVPN_OVPN_FILE environment variable is not set. (Note: now used as default, rotation script picks)"
+#   exit 1
+# fi
+
+AUTH_FILE_PATH="/etc/openvpn/auth.txt"
+DNS_UPDATE_SCRIPT="/etc/openvpn/update-resolv-conf" # Path set in Dockerfile
+
+# This check is still good to ensure the script exists.
+if [ ! -x "$DNS_UPDATE_SCRIPT" ]; then
+  echo "Error: DNS update script not found or not executable at $DNS_UPDATE_SCRIPT. Build issue?"
+  exit 1
+fi
+
+# --- CREATE OPENVPN AUTH FILE ---
+echo "Creating OpenVPN auth file at $AUTH_FILE_PATH..."
+printf "%s\n" "$PVPN_USERNAME" > "$AUTH_FILE_PATH"
+printf "%s\n" "$PVPN_PASSWORD" >> "$AUTH_FILE_PATH"
+chmod 600 "$AUTH_FILE_PATH"
+echo "Auth file created."
+
+# The OpenVPN and Privoxy start logic is now moved to rotate_vpn.sh
+# The DNS override, HOST_NETWORK, etc., will also be handled within the loop of rotate_vpn.sh
+# if relevant per connection.
+
+echo "Initial setup complete. Handing over to VPN rotation supervisor /app/rotate_vpn.sh..."
+exec /app/rotate_vpn.sh
+

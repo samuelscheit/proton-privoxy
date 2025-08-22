@@ -50,10 +50,7 @@ printf "%s\n" "$PVPN_PASSWORD" >> "$AUTH_FILE_PATH"
 chmod 600 "$AUTH_FILE_PATH"
 echo "Auth file created."
 
-# The OpenVPN and Privoxy start logic is now moved to rotate_vpn.sh
-# The DNS override, HOST_NETWORK, etc., will also be handled within the loop of rotate_vpn.sh
-# if relevant per connection.
+echo "Initial setup complete. Determining operation mode..."
 
-echo "Initial setup complete. Handing over to VPN rotation supervisor /app/rotate_vpn.sh..."
-exec /app/rotate_vpn.sh
+exec /app/multi_connect.sh
 

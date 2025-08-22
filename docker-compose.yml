@@ -1,12 +1,12 @@
 #version: "3.9"
 
 services:
-  proton-privoxy:
+  proton:
     build: .
-    container_name: proton_privoxy_service
+    container_name: proton_service
     ports:
-      - "0.0.0.0:8100:8100" # Expose Privoxy port only to localhost on the host by default for security
-                              # Change to "8080:8080" if you need to access it from other machines on your LAN
+      - "0.0.0.0:8100:8100"
+      - "8100-8200:8100-8200"
     cap_add:
       - NET_ADMIN             # Required for OpenVPN to modify network interfaces and routes
     # devices:                # Usually not needed if mknod in app/run works for /dev/net/tun

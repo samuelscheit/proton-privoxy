@@ -1,3 +1,6 @@
 .env
-ovpn_configs/*
+ovpn_configs*/*
 my_host_auth.txt
+node_modules/
+.DS_Store
+

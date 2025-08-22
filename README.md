@@ -1,15 +1,6 @@
-# Proton-Privoxy Docker
+# Proton-Multi-Rotating Docker
 
-This project sets up a Privoxy HTTP proxy that routes all its traffic through a ProtonVPN OpenVPN connection. The OpenVPN server is automatically rotated at a configurable interval.
-
-## Features
-
--   Privoxy HTTP Proxy
--   ProtonVPN integration using OpenVPN
--   Automatic rotation of ProtonVPN servers
--   Configurable rotation interval
--   DNS override capability
--   Dockerized for easy deployment
+This project sets up a HTTP proxy that routes all its traffic through multiple ProtonVPN OpenVPN connection. The choosen tunnel is automatically rotated for each request.
 
 ## Prerequisites
 
@@ -22,7 +13,7 @@ This project sets up a Privoxy HTTP proxy that routes all its traffic through a 
 1.  **Clone the Repository (if applicable later):**
     ```bash
     git clone <repository_url>
-    cd proton-privoxy-docker
+    cd proton-docker
     ```
 
 2.  **OpenVPN Configurations:**
@@ -62,8 +53,10 @@ This project sets up a Privoxy HTTP proxy that routes all its traffic through a 
 Once the container is running, configure your browser or application to use an HTTP proxy:
 
 -   **Host/Address:** `localhost` (if running Docker locally) or the IP address of the machine running Docker.
--   **Port:** `8100` (or as configured in `docker-compose.yml` and Privoxy's `app/config`).
+-   **Port:** `8100` (or as configured in `docker-compose.yml`).
+
+For multi-connection mode, pick the port of the container corresponding to the desired tunnel.
 
 Check the logs to see the VPN server rotation:
 ```bash
-docker-compose logs -f proton_privoxy_service
+docker-compose logs -f proton_service

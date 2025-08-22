@@ -1,4 +1,4 @@
-FROM alpine:latest
+FROM node:24-alpine
 
 LABEL maintainer="Proton-Privoxy User"
 
@@ -13,41 +13,36 @@ ENV PVPN_USERNAME="" \
 
 # Install packages
 RUN apk --no-cache add \
-        coreutils \
-        openvpn \
-        openresolv \
-        privoxy \
-        procps \
-        wget \
-        bash \
-        findutils `# Usually part of base, but good to be explicit for 'find'` \
-    && echo "Core packages installed." \
+    coreutils \
+    openvpn \
+    openresolv \
+    procps \
+    wget \
+    bash \
+    findutils `# Usually part of base, but good to be explicit for 'find'` \
+    iproute2 \
+    && echo "Core packages installed (openvpn + tooling, removed nginx/privoxy)." \
     \
     && echo "Downloading ProtonVPN DNS update script (update-resolv-conf.sh)..." \
     && mkdir -p /etc/openvpn \
     && wget "https://raw.githubusercontent.com/ProtonVPN/scripts/master/update-resolv-conf.sh" -O "/etc/openvpn/update-resolv-conf" \
     && chmod +x "/etc/openvpn/update-resolv-conf" \
-    && echo "update-resolv-conf.sh downloaded and made executable." \
-    \
-    && echo "Ensuring Privoxy base config directory exists..." \
-    && mkdir -p /etc/privoxy \
-    && echo "Privoxy config directory /etc/privoxy ensured."
+    && echo "update-resolv-conf.sh downloaded and made executable."
 
-# Copy application scripts and Privoxy main configuration
+# Copy application source
 COPY app /app
 
 # Copy downloaded OpenVPN configuration files from host to image
 COPY ovpn_configs /etc/openvpn/configs
 
-# Copy minimal/empty Privoxy standard config files
-COPY empty.filter /etc/privoxy/default.filter
-COPY default.action /etc/privoxy/default.action
-COPY match-all.action /etc/privoxy/match-all.action
+# Make the scripts executable (legacy helper scripts if any)
+RUN chmod +x /app/run || true \
+    && chmod +x /app/*.sh || true
 
-# Make the scripts executable
-RUN chmod +x /app/run \
-    && chmod +x /app/rotate_vpn.sh
+# Install TS dependencies and build
+WORKDIR /app
+RUN if [ -f package.json ]; then npm install || true; fi
 
-# Default command to run when the container starts
-CMD ["/app/run"]
+# Default command now runs the TypeScript-compiled supervisor if present, else fallback to legacy shell script
+CMD ["sh", "-c", "node /app/index.ts" ]
 

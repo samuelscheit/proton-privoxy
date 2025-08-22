@@ -1,0 +1,16 @@
+{
+  "name": "proton-privoxy-multi-connect",
+  "version": "1.0.0",
+  "description": "Multi OpenVPN + Privoxy supervisor with nginx stream load balancer (TypeScript port)",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "start": "bun run index.ts",
+    "dev": "bun run --watch index.ts"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "typescript": "^5.4.0",
+    "@types/node": "^20.11.30"
+  }
+}

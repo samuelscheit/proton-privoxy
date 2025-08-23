@@ -40,6 +40,8 @@ RUN apt update && apt install -y \
     bash \
     findutils `# Usually part of base, but good to be explicit for 'find'` \
     iproute2 \
+    build-essential \
+    python3 \
     && echo "Core packages installed (openvpn + tooling, removed nginx/privoxy)." \
     \
     && echo "Downloading ProtonVPN DNS update script (update-resolv-conf.sh)..." \
@@ -51,6 +53,7 @@ RUN apt update && apt install -y \
 # RUN mkdir -p /run/dbus && chmod -R 777 /run/dbus && groupadd -r myuser && useradd -r -g myuser -s /bin/bash -G audio,video -m myuser
 
 
+COPY ./tundialer-native /tundialer-native
 COPY ./app/package.json ./app/package-lock.json /app/
 
 WORKDIR /app

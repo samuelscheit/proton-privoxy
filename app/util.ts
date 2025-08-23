@@ -1,7 +1,7 @@
-export default function debounce<T extends Function>(func: T, wait: number, immediate?: boolean): T {
+export default function debounce<T extends Function>(func: T, wait: number, immediate?: boolean) {
 	let timeout: any;
 
-	return function (...args: any[]) {
+	const f = function (...args: any[]) {
 		return new Promise((resolve) => {
 			clearTimeout(timeout);
 			timeout = setTimeout(() => {
@@ -17,4 +17,8 @@ export default function debounce<T extends Function>(func: T, wait: number, imme
 			}
 		});
 	} as any;
+
+	f.immediate = func;
+
+	return f as T & { immediate: T };
 }

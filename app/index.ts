@@ -4,6 +4,7 @@ import path from "path";
 import net from "net";
 import { URL } from "url";
 import dns from "dns";
+import { connectViaDialer } from "./dialer.ts";
 import { resetCredentials } from "./browser.ts";
 
 process.on("uncaughtException", console.error);
@@ -24,10 +25,9 @@ const OVPN_CONFIG_DIR = "/etc/openvpn/configs";
 const OPENVPN_BASE_LOG_DIR = "/tmp/multi_ovpn_logs";
 const BASE_PORT = intFromEnv("BASE_PROXY_PORT", 8100); // rotating proxy port
 const MAX_CONNECTIONS = intFromEnv("MAX_CONNECTIONS", 0);
-const DNS_SERVERS_OVERRIDE = (ENV.DNS_SERVERS_OVERRIDE || "").trim();
+const DNS_SERVERS_OVERRIDE = (ENV.DNS_SERVERS_OVERRIDE || "1.1.1.1,8.8.8.8").trim();
 const START_PORT_GAP = intFromEnv("PORT_GAP", 1); // increment between proxy ports
 const CONNECT_BACKLOG = intFromEnv("PROXY_BACKLOG", 128);
-const TUN_IP_WAIT_MS = intFromEnv("TUN_IP_WAIT_MS", 15000); // wait after openvpn launch
 const REQUIRE_TUN_IP = boolFromEnv("REQUIRE_TUN_IP", true);
 
 function intFromEnv(name: string, def: number): number {
@@ -106,7 +106,6 @@ function getCurrentAuth(): { username: string; password: string } {
 function launchOpenVPN(t: TunnelInfo) {
 	const logDir = path.join(OPENVPN_BASE_LOG_DIR, t.configName);
 	fs.mkdir(logDir, { recursive: true });
-	const logPath = path.join(logDir, "openvpn.log");
 	const startAuth = getCurrentAuth();
 
 	const args = [
@@ -117,6 +116,7 @@ function launchOpenVPN(t: TunnelInfo) {
 		"--auth-user-pass",
 		AUTH_FILE_PATH,
 		"--auth-nocache",
+		"--float",
 		"--pull-filter",
 		"ignore",
 		"route-ipv6",
@@ -125,11 +125,11 @@ function launchOpenVPN(t: TunnelInfo) {
 		"ifconfig-ipv6",
 		"--pull-filter",
 		"ignore",
+		"dhcp-option",
+		"--pull-filter",
+		"ignore",
 		"redirect-gateway",
-		// "--log",
-		// logPath,
-		"--script-security",
-		"2",
+		"--route-nopull",
 	];
 	const process = spawn("openvpn", args, { stdio: "pipe" });
 
@@ -154,14 +154,9 @@ function launchOpenVPN(t: TunnelInfo) {
 		if (msg) console.error(`[openvpn] ${t.configName} stderr: ${msg}`);
 	});
 
-	process.stdout?.on("data", (data) => {
-		const msg = (data || "").toString("utf8").trim();
-		if (msg) console.log(`[openvpn] ${t.configName} stdout: ${msg}`);
-	});
+	console.log(`[openvpn] launched ${t.configName} dev=${t.devName} port=${t.port}`);
 
-	console.log(`[openvpn] launched ${t.configName} dev=${t.devName} port=${t.port} log=${logPath}`);
-
-	return new Promise((resolve, reject) => {
+	return new Promise<TunnelInfo>((resolve, reject) => {
 		let logs = [] as string[];
 
 		process.stdout.on("data", async (data) => {
@@ -172,11 +167,13 @@ function launchOpenVPN(t: TunnelInfo) {
 
 				logs.push(l);
 
+				console.log(`[openvpn] ${t.configName} stdout: ${line}`);
+
 				if (l.includes("net_addr_v4_add")) {
 					const ip = l.match(/((25[0-5]|(2[0-4]|1\d|[1-9]|)\d)\.?\b){4}/);
-					if (!ip) continue
+					if (!ip) continue;
 					t.interfaceIp = ip[0];
-
+					console.log(`[openvpn] ${t.configName} assigned IP ${t.interfaceIp}`);
 				} else if (l.includes("AUTH_FAILED")) {
 					const currentAuth = getCurrentAuth();
 					if (currentAuth.username === startAuth.username && currentAuth.password === startAuth.password) {
@@ -189,7 +186,7 @@ function launchOpenVPN(t: TunnelInfo) {
 
 					return await launchOpenVPN(t).then(resolve).catch(reject);
 				} else if (l.includes("Initialization Sequence Completed")) {
-					resolve(t)
+					resolve(t);
 				}
 			}
 		});
@@ -215,8 +212,14 @@ function createTcpProxy(t: TunnelInfo) {
 	server.on("error", (e) => console.error(`Proxy ${t.configName}:${t.port} error`, e));
 	// Bun sometimes mis-identifies the 4-arg overload; use 3-arg then add 'listening' event
 	server.listen({ port: t.port, host: "0.0.0.0", backlog: CONNECT_BACKLOG });
-	server.on("listening", () => {
-		console.log(`Proxy up for ${t.configName} dev=${t.devName} port=${t.port} localAddress=${t.interfaceIp || "default"}`);
+
+	return new Promise<void>((resolve, reject) => {
+		server.on("listening", () => {
+			console.log(`Proxy up for ${t.configName} dev=${t.devName} port=${t.port} localAddress=${t.interfaceIp || "default"}`);
+			resolve();
+		});
+
+		server.on("error", (e) => reject(e));
 	});
 }
 
@@ -251,30 +254,53 @@ function processInitialClientData(firstChunk: Buffer, client: net.Socket, pickTu
 		client.destroy();
 		return;
 	}
-	const str = firstChunk.toString("utf8");
-	const first = str.split("\n")[0] || "";
-	if (/^CONNECT\s+/i.test(first)) {
-		const target = first.split(/\s+/)[1];
-		handleConnect(target, client, firstChunk, t);
-	} else if (/^[A-Z]+\s+https?:\/\//.test(first)) {
-		const hostLine = str.match(/Host:\s*([^\r\n]+)/i);
+
+	const separator = "\r\n\r\n";
+	const separatorIndex = firstChunk.indexOf(separator);
+
+	if (separatorIndex === -1) {
+		client.destroy(); // Incomplete headers
+		return;
+	}
+
+	const headersPart = firstChunk.subarray(0, separatorIndex);
+	const restOfChunk = firstChunk.subarray(separatorIndex + separator.length);
+	const headers = headersPart.toString("utf8");
+	const firstLine = headers.split("\r\n")[0] || "";
+
+	if (/^CONNECT\s+/i.test(firstLine)) {
+		const target = firstLine.split(/\s+/)[1];
+		if (!target) {
+			client.destroy();
+			return;
+		}
+		// For CONNECT, we establish a tunnel. Any data after the headers is part of the tunnelled stream.
+		handleConnect(target, client, restOfChunk, t, false);
+	} else if (/^[A-Z]+\s+https?:\/\//.test(firstLine)) {
+		const hostLine = headers.match(/Host:\s*([^\r\n]+)/i);
 		const host = hostLine?.[1];
-		const urlHost = host
-			? host
-			: (() => {
-					try {
-						return new URL(first.split(/\s+/)[1]).host;
-					} catch {
-						return undefined;
-					}
-				})();
-		handleConnect(`${urlHost || ""}:80`, client, firstChunk, t, true);
+		const urlHost =
+			host ||
+			(() => {
+				try {
+					// The second part of the request line is the URL
+					return new URL(firstLine.split(/\s+/)[1]).host;
+				} catch {
+					return undefined;
+				}
+			})();
+		if (!urlHost) {
+			client.destroy();
+			return;
+		}
+		// For HTTP forwarding, the whole first chunk is the request.
+		handleConnect(`${urlHost}:80`, client, firstChunk, t, true);
 	} else {
 		client.destroy();
 	}
 }
 
-function handleConnect(target: string, client: net.Socket, firstChunk: Buffer, tunnel: TunnelInfo, isHttpForward = false) {
+function handleConnect(target: string, client: net.Socket, initialData: Buffer, tunnel: TunnelInfo, isHttpForward = false) {
 	// Leak protection: never forward without a bound tunnel IP
 	if (REQUIRE_TUN_IP && !tunnel.interfaceIp) {
 		client.destroy();
@@ -288,31 +314,56 @@ function handleConnect(target: string, client: net.Socket, firstChunk: Buffer, t
 	}
 
 	const connectWith = (dstIp: string) => {
-		// Debug: show kernel routing decision for this src/dst
-		try {
-			const dbg = spawnSync("sh", ["-c", `ip -4 route get ${dstIp} from ${tunnel.interfaceIp} 2>&1 | head -n1`], {
-				encoding: "utf8",
-			});
-			const line = (dbg.stdout || dbg.stderr || "").trim();
-		} catch {}
+		console.log(`[proxy] ${tunnel.configName} forwarding to ${host}(${dstIp}):${port} from dev=${tunnel.devName}`);
 
-		const remote = net.connect({ host: dstIp, port, localAddress: tunnel.interfaceIp }, () => {
-			const la = (remote as any).localAddress || "";
-			const lp = (remote as any).localPort || "";
-			const ra = (remote as any).remoteAddress || dstIp;
-			const rp = (remote as any).remotePort || port;
-			console.log(`[socket] local=${la}:${lp} -> remote=${ra}:${rp} (requested local=${tunnel.interfaceIp})`);
-			if (isHttpForward) {
-				remote.write(firstChunk);
-			} else {
-				client.write("HTTP/1.1 200 Connection Established\r\n\r\n");
-			}
+		console.log(`[socket] using dialer dev=${tunnel.devName} -> ${dstIp}:${port}`);
+		const remote = connectViaDialer(tunnel.devName, dstIp, port);
+
+		const setupPipe = () => {
 			client.pipe(remote).pipe(client);
-		});
-		remote.on("error", (e) => {
-			console.warn(`[socket-error] ${e?.message || e}`);
+		};
+
+		remote.on("error", (err) => {
+			console.warn(`[dialer-socket-error] ${err.message}`);
 			client.destroy();
 		});
+		remote.on("close", () => client.destroy());
+		client.on("close", () => remote.destroy());
+		client.on("error", (err) => {
+			console.warn(`[client-socket-error] ${err.message}`);
+			remote.destroy();
+		});
+
+		if (isHttpForward) {
+			remote.write(initialData, (err) => {
+				if (err) {
+					client.destroy();
+					remote.destroy();
+				} else {
+					setupPipe();
+				}
+			});
+		} else {
+			client.write("HTTP/1.1 200 Connection Established\r\n\r\n", (err) => {
+				if (err) {
+					client.destroy();
+					remote.destroy();
+					return;
+				}
+				if (initialData.length > 0) {
+					remote.write(initialData, (err) => {
+						if (err) {
+							client.destroy();
+							remote.destroy();
+						} else {
+							setupPipe();
+						}
+					});
+				} else {
+					setupPipe();
+				}
+			});
+		}
 	};
 
 	// If target host is already an IP, use it directly; else resolve to IPv4 to avoid v6/v4 ambiguity
@@ -329,11 +380,16 @@ function handleConnect(target: string, client: net.Socket, firstChunk: Buffer, t
 	}
 }
 
+function sleep(ms: number) {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 async function main() {
-	console.log("-- Multi OpenVPN + TS TCP proxy (no nginx/privoxy) --");
 	await ensureTun();
 
-	const credentials = await resetCredentials()
+	const credentials = await resetCredentials.immediate();
+	await sleep(1000 * 5); // wait for credentials to propagate
+
 	await ensureAuth(credentials.username, credentials.password);
 	await fs.mkdir(OPENVPN_BASE_LOG_DIR, { recursive: true });
 	await overrideDNS();
@@ -341,14 +397,18 @@ async function main() {
 	const configs = await listConfigs();
 	const tunnels = await assignPorts(configs);
 	console.log(`Launching ${tunnels.length} openvpn tunnels`);
-	const promises = tunnels.map(launchOpenVPN);
+
+	console.log(`Starting rotating proxy on port ${BASE_PORT}`);
+
+	createRotatingProxy(BASE_PORT, tunnels);
+
+	const promises = tunnels.map((x) => launchOpenVPN(x).then((x) => createTcpProxy(x)));
 
 	await Promise.allSettled(promises);
 
-	console.log(`Waiting for tunnel to connect and IP provisioning...`);
-	const proxies = tunnels.map(createTcpProxy);
+	console.log(`All Tunnels are up and running`);
 
-	createRotatingProxy(BASE_PORT, tunnels);
+	console.log(`Service is ready. Connect your applications to the rotating proxy on port ${BASE_PORT}`);
 }
 
 main().catch((e) => {

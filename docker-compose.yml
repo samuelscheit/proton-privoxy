@@ -5,7 +5,7 @@ services:
     build: .
     container_name: proton_service
     ports:
-      - "8100-8200:8100-8200" # increase when you have more openvpn configs
+      - "0.0.0.0:8100-8200:8100-8200" # increase when you have more openvpn configs
     cap_add:
       - NET_ADMIN             # Required for OpenVPN to modify network interfaces and routes
     # devices:                # Usually not needed if mknod in app/run works for /dev/net/tun

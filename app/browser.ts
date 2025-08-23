@@ -147,7 +147,7 @@ export const resetCredentials = debounce(async function resetCredentials() {
 				if (json.Error) {
 					page.locator("#password").fill(process.env.PROTON_PASSWORD || "");
 					await page.click(`button[type=submit][form="auth-form"]`);
-					await sleep(1000)
+					await sleep(3000)
 
 					page.off("response", onResponse);
 
@@ -181,6 +181,6 @@ export const resetCredentials = debounce(async function resetCredentials() {
 
 		await reset.click({});
 	});
-}, 1000 * 0)!;
+}, 1000 * 20)!;
 
 // resetCredentials().then(console.log).catch(console.error);

@@ -8,9 +8,15 @@
     "start": "bun run index.ts",
     "dev": "bun run --watch index.ts"
   },
-  "dependencies": {},
+  "dependencies": {
+    "dotenv": "^17.2.1",
+    "lodash": "^4.17.21",
+    "patchright": "^1.52.5",
+    "puppeteer-core": "^24.17.0"
+  },
   "devDependencies": {
-    "typescript": "^5.4.0",
-    "@types/node": "^20.11.30"
+    "@types/lodash": "^4.17.20",
+    "@types/node": "^20.11.30",
+    "typescript": "^5.4.0"
   }
 }

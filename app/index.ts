@@ -1,9 +1,13 @@
 import { spawn, spawnSync } from "child_process";
-import { promises as fs, existsSync } from "fs";
+import { promises as fs, existsSync, readFileSync } from "fs";
 import path from "path";
 import net from "net";
 import { URL } from "url";
 import dns from "dns";
+import { resetCredentials } from "./browser.ts";
+
+process.on("uncaughtException", console.error);
+process.on("unhandledRejection", console.error);
 
 interface TunnelInfo {
 	index: number; // sequential index
@@ -47,10 +51,8 @@ async function ensureTun(): Promise<void> {
 	if (!existsSync("/dev/net/tun")) throw new Error("Cannot create /dev/net/tun");
 }
 
-async function ensureAuth(): Promise<void> {
+async function ensureAuth(u = ENV.PVPN_USERNAME, p = ENV.PVPN_PASSWORD): Promise<void> {
 	if (existsSync(AUTH_FILE_PATH)) return;
-	const u = ENV.PVPN_USERNAME || "";
-	const p = ENV.PVPN_PASSWORD || "";
 	if (!u || !p) throw new Error("PVPN_USERNAME/PVPN_PASSWORD required");
 	await fs.writeFile(AUTH_FILE_PATH, `${u}\n${p}\n`, { mode: 0o600 });
 }
@@ -89,10 +91,24 @@ async function overrideDNS(): Promise<void> {
 	await fs.writeFile("/etc/resolv.conf", ["# overridden", ...servers.map((s) => `nameserver ${s}`)].join("\n") + "\n");
 }
 
-function launchOpenVPN(t: TunnelInfo): void {
+function getCurrentAuth(): { username: string; password: string } {
+	const content = readFileSync(AUTH_FILE_PATH, "utf-8");
+	const lines = content
+		.split("\n")
+		.map((l) => l.trim())
+		.filter(Boolean);
+	if (lines.length >= 2) {
+		return { username: lines[0], password: lines[1] };
+	}
+	throw new Error("Invalid auth file format");
+}
+
+function launchOpenVPN(t: TunnelInfo) {
 	const logDir = path.join(OPENVPN_BASE_LOG_DIR, t.configName);
 	fs.mkdir(logDir, { recursive: true });
 	const logPath = path.join(logDir, "openvpn.log");
+	const startAuth = getCurrentAuth();
+
 	const args = [
 		"--config",
 		t.configPath,
@@ -110,126 +126,86 @@ function launchOpenVPN(t: TunnelInfo): void {
 		"--pull-filter",
 		"ignore",
 		"redirect-gateway",
-		"--log",
-		logPath,
+		// "--log",
+		// logPath,
 		"--script-security",
 		"2",
-		"--up",
-		"/etc/openvpn/update-resolv-conf",
-		"--down",
-		"/etc/openvpn/update-resolv-conf",
-		"--daemon",
 	];
-	spawn("openvpn", args, { stdio: "pipe" });
+	const process = spawn("openvpn", args, { stdio: "pipe" });
+
+	process.on("close", (code, signal) => {
+		console.warn(`[openvpn] ${t.configName} exited with code=${code} signal=${signal}`);
+	});
+
+	process.on("error", (err) => {
+		console.error(`[openvpn] ${t.configName} error: ${err?.message || err}`);
+	});
+
+	process.on("closed", () => {
+		console.warn(`[openvpn] ${t.configName} closed`);
+	});
+
+	process.on("disconnect", () => {
+		console.warn(`[openvpn] ${t.configName} disconnected`);
+	});
+
+	process.stderr?.on("data", (data) => {
+		const msg = (data || "").toString("utf8").trim();
+		if (msg) console.error(`[openvpn] ${t.configName} stderr: ${msg}`);
+	});
+
+	process.stdout?.on("data", (data) => {
+		const msg = (data || "").toString("utf8").trim();
+		if (msg) console.log(`[openvpn] ${t.configName} stdout: ${msg}`);
+	});
+
+	console.log(`[openvpn] launched ${t.configName} dev=${t.devName} port=${t.port} log=${logPath}`);
+
+	return new Promise((resolve, reject) => {
+		let logs = [] as string[];
+
+		process.stdout.on("data", async (data) => {
+			const lines = (data || "").toString("utf8").trim().split(/\r?\n/);
+			for (const line of lines) {
+				const l = line.trim();
+				if (!l) continue;
+
+				logs.push(l);
+
+				if (l.includes("net_addr_v4_add")) {
+					const ip = l.match(/((25[0-5]|(2[0-4]|1\d|[1-9]|)\d)\.?\b){4}/);
+					if (!ip) continue
+					t.interfaceIp = ip[0];
+
+				} else if (l.includes("AUTH_FAILED")) {
+					const currentAuth = getCurrentAuth();
+					if (currentAuth.username === startAuth.username && currentAuth.password === startAuth.password) {
+						const credentials = await resetCredentials();
+
+						await ensureAuth(credentials.username, credentials.password);
+					}
+
+					process.kill();
+
+					return await launchOpenVPN(t).then(resolve).catch(reject);
+				} else if (l.includes("Initialization Sequence Completed")) {
+					resolve(t)
+				}
+			}
+		});
+
+		process.on("exit", (code, signal) => {
+			const allLogs = logs.join("\n");
+			const err = new Error(`OpenVPN process for ${t.configName} exited with code=${code} signal=${signal}\nLogs:\n${allLogs}`);
+			console.error(err.message);
+
+			launchOpenVPN(t).then(resolve).catch(reject);
+		});
+	});
 }
 
 async function wait(ms: number) {
 	return new Promise((r) => setTimeout(r, ms));
-}
-
-async function collectTunnelIps(): Promise<Record<string, string>> {
-	// Map devName -> IPv4 using iproute2. Try JSON first, then fall back.
-	try {
-		// Try: ip -j -4 address show
-		const jsonOut = spawnSync("sh", ["-c", "ip -j -4 address show 2>/dev/null"], {
-			encoding: "utf8",
-		});
-		if (jsonOut.stdout && jsonOut.stdout.trim()) {
-			try {
-				const parsed = JSON.parse(jsonOut.stdout);
-				const map: Record<string, string> = {};
-				for (const iface of parsed) {
-					const name = iface?.ifname as string | undefined;
-					if (!name || !/^tun\d+$/i.test(name)) continue;
-					const addrs = (iface?.addr_info as any[] | undefined) || [];
-					const v4 = addrs.find((a) => a?.family === "inet" && a?.local);
-					if (v4?.local) map[name] = String(v4.local);
-				}
-				if (Object.keys(map).length) return map;
-			} catch {
-				// fall through to text parsing
-			}
-		}
-		// Fallback: ip -4 -o addr show | awk to filter tun devices
-		const out = spawnSync(
-			"sh",
-			["-c", "ip -4 -o addr show 2>/dev/null | awk '$2 ~ /^tun[0-9]+$/ {print $2, $4}'"],
-			{ encoding: "utf8" }
-		);
-		const map: Record<string, string> = {};
-		const stdout = out.stdout || "";
-		if (stdout.trim()) console.log("ip addresses", stdout);
-		stdout.split(/\n/).forEach((line) => {
-			const [dev, cidr] = line.trim().split(/\s+/);
-			if (dev && cidr) map[dev] = cidr.split("/")[0];
-		});
-		return map;
-	} catch {
-		return {};
-	}
-}
-
-async function collectTunnelIpsFromLogs(tunnels: TunnelInfo[]): Promise<Record<string, string>> {
-	const result: Record<string, string> = {};
-	for (const t of tunnels) {
-		try {
-			const logPath = path.join(OPENVPN_BASE_LOG_DIR, t.configName, "openvpn.log");
-			const content = await fs.readFile(logPath, "utf8").catch(() => "");
-			if (!content) continue;
-			// Common OpenVPN log patterns that contain the assigned IPv4
-			const patterns = [
-				/net_addr_v4_add:\s*([0-9.]+)\/[0-9]+\s+dev\s+([\w-]+)/, // OpenVPN 2.5+
-				/ ifconfig\s+([0-9.]+)\s+[0-9.]+/, // legacy ifconfig output
-				/ local\s+IP\.addr\s*=\s*([0-9.]+)/, // occasionally present
-			];
-			for (const rx of patterns) {
-				const m = content.match(rx);
-				if (m && m[1]) {
-					result[t.devName] = m[1];
-					break;
-				}
-			}
-		} catch {
-			// ignore and continue
-		}
-	}
-	return result;
-}
-
-async function waitForTunnelIps(tunnels: TunnelInfo[]): Promise<Record<string, string>> {
-	const end = Date.now() + TUN_IP_WAIT_MS;
-	let map: Record<string, string> = {};
-	while (Date.now() < end) {
-		map = await collectTunnelIps();
-		const have = tunnels.filter((t) => map[t.devName]).length;
-		if (have === tunnels.length) return map;
-		await wait(1000);
-	}
-	// Last resort: try to infer from logs
-	const fromLogs = await collectTunnelIpsFromLogs(tunnels);
-	return Object.keys(fromLogs).length ? fromLogs : map;
-}
-
-async function tailLog(filePath: string, lines = 120): Promise<string> {
-	try {
-		const data = await fs.readFile(filePath, "utf8");
-		const parts = data.split(/\r?\n/);
-		return parts.slice(-lines).join("\n");
-	} catch {
-		return "";
-	}
-}
-
-function ensureSourceRouting(t: TunnelInfo) {
-	if (!t.interfaceIp) return;
-	const table = 100 + t.index; // dedicated routing table per tunnel
-	const ip = t.interfaceIp;
-	// Remove any previous rule for this IP/table, then add a clean rule.
-	spawnSync("sh", ["-c", `ip -4 rule del from ${ip}/32 table ${table} 2>/dev/null || true`]);
-	spawnSync("sh", ["-c", `ip -4 rule add from ${ip}/32 table ${table} priority ${1000 + t.index}`]);
-	// Ensure a default route via the tun device exists in that table.
-	spawnSync("sh", ["-c", `ip -4 route replace default dev ${t.devName} table ${table}`]);
-	console.log(`[routing] table ${table}: from ${ip}/32 -> default dev ${t.devName}`);
 }
 
 function createTcpProxy(t: TunnelInfo) {
@@ -314,12 +290,12 @@ function handleConnect(target: string, client: net.Socket, firstChunk: Buffer, t
 	const connectWith = (dstIp: string) => {
 		// Debug: show kernel routing decision for this src/dst
 		try {
-			const dbg = spawnSync("sh", ["-c", `ip -4 route get ${dstIp} from ${tunnel.interfaceIp} 2>&1 | head -n1`], { encoding: "utf8" });
+			const dbg = spawnSync("sh", ["-c", `ip -4 route get ${dstIp} from ${tunnel.interfaceIp} 2>&1 | head -n1`], {
+				encoding: "utf8",
+			});
 			const line = (dbg.stdout || dbg.stderr || "").trim();
-			console.log(`[route] src=${tunnel.interfaceIp} dst=${dstIp} -> ${line}`);
 		} catch {}
 
-		console.log("connect to ", dstIp, port, "using", tunnel.interfaceIp);
 		const remote = net.connect({ host: dstIp, port, localAddress: tunnel.interfaceIp }, () => {
 			const la = (remote as any).localAddress || "";
 			const lp = (remote as any).localPort || "";
@@ -356,43 +332,22 @@ function handleConnect(target: string, client: net.Socket, firstChunk: Buffer, t
 async function main() {
 	console.log("-- Multi OpenVPN + TS TCP proxy (no nginx/privoxy) --");
 	await ensureTun();
-	await ensureAuth();
+
+	const credentials = await resetCredentials()
+	await ensureAuth(credentials.username, credentials.password);
 	await fs.mkdir(OPENVPN_BASE_LOG_DIR, { recursive: true });
 	await overrideDNS();
 
 	const configs = await listConfigs();
 	const tunnels = await assignPorts(configs);
 	console.log(`Launching ${tunnels.length} openvpn tunnels`);
-	tunnels.forEach(launchOpenVPN);
+	const promises = tunnels.map(launchOpenVPN);
+
+	await Promise.allSettled(promises);
+
 	console.log(`Waiting for tunnel to connect and IP provisioning...`);
-	// await wait(TUN_IP_WAIT_MS);
+	const proxies = tunnels.map(createTcpProxy);
 
-	// For simplicity we reuse the same detected tun IP for all proxies; advanced: map pid->iface
-	const ipMap = await waitForTunnelIps(tunnels);
-	tunnels.forEach((t) => {
-		t.interfaceIp = ipMap[t.devName];
-	});
-	// Install per-tunnel source routing so each proxy egresses via its own tunX
-	for (const t of tunnels) {
-		if (t.interfaceIp) ensureSourceRouting(t);
-	}
-	const missing = tunnels.filter((t) => !t.interfaceIp).length;
-	if (missing) {
-		console.warn(`${missing} tunnel(s) missing IP assignment; they will use default routing.`);
-		for (const t of tunnels.filter((x) => !x.interfaceIp)) {
-			const logPath = path.join(OPENVPN_BASE_LOG_DIR, t.configName, "openvpn.log");
-			const tail = await tailLog(logPath, 120);
-			console.warn(`[${t.devName}] ${t.configName} — openvpn.log (last 120 lines):\n${tail || "(empty)"}`);
-		}
-		if (REQUIRE_TUN_IP) {
-			console.error(`Leak protection active: refusing to start proxies because ${missing} tunnel(s) have no IP. Set REQUIRE_TUN_IP=0 to override (not recommended).`);
-			process.exit(2);
-		}
-	}
-
-	// Start per-tunnel proxies only when safe
-	tunnels.forEach(createTcpProxy);
-	// Also start a single rotating proxy on BASE_PORT selecting a different tunnel per request
 	createRotatingProxy(BASE_PORT, tunnels);
 }
 
